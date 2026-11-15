@@ -1,0 +1,37 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+  namespace: argocd
+  annotations:
+    # Ye version GitHub Actions pipeline inject karti hai
+    app.kubernetes.io/version: "auto"
+spec:
+  project: default
+
+  # Source: GitHub repo ka helm chart
+  source:
+    repoURL: https://github.com/YOUR_GITHUB_USERNAME/YOUR_GITHUB_REPO
+    targetRevision: HEAD
+    path: helm/myapp          # ⚠️ Note: helm chart ADO repo mein hai
+                              # Agar alag repo hai to wahan point karo
+    helm:
+      valueFiles:
+        - values.yaml
+      # image.tag GitHub Actions pipeline --helm-set se override karegi
+      parameters:
+        - name: image.tag
+          value: "latest"     # GitHub Actions is value ko override karegi
+
+  # Destination: GKE cluster
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kabir
+
+  # Sync policy: automatic
+  syncPolicy:
+    automated:
+      prune: true       # Purani resources delete ho jayegi
+      selfHeal: true    # Koi manual change kare to auto revert
+    syncOptions:
+      - CreateNamespace=true
