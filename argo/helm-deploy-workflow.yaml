@@ -1,0 +1,195 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: helm-deploy
+  namespace: argo
+spec:
+  # ── Parameters — GitHub Actions se aate hain ────────────────────────────
+  arguments:
+    parameters:
+      - name: app_version        # e.g. "1.0.456"
+      - name: docker_image       # e.g. "pawanjadon/kabirepo"
+      - name: app_namespace      # e.g. "kabir"
+      - name: artifact_name      # e.g. "myapp"
+      - name: github_repo        # e.g. "pawanjadon32/infovista-infra"
+      - name: github_token       # GitHub Token — ZIP download ke liye
+
+  entrypoint: deploy-pipeline
+
+  # ── Shared volume: steps ke beech data share hoga ───────────────────────
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 500Mi
+
+  templates:
+
+    # ── Main pipeline ────────────────────────────────────────────────────
+    - name: deploy-pipeline
+      steps:
+        - - name: download-artifact
+            template: download-artifact
+
+        - - name: helm-deploy
+            template: helm-deploy
+
+    # ── Step 1: GitHub Release se ZIP download karo ─────────────────────
+    - name: download-artifact
+      inputs:
+        parameters:
+          - name: app_version
+            value: "{{workflow.parameters.app_version}}"
+          - name: github_repo
+            value: "{{workflow.parameters.github_repo}}"
+          - name: github_token
+            value: "{{workflow.parameters.github_token}}"
+      container:
+        image: python:3.11-slim
+        command: [bash, -c]
+        args:
+          - |
+            set -e
+
+            apt-get update -qq && apt-get install -y -qq curl unzip
+
+            VERSION="{{inputs.parameters.app_version}}"
+            REPO="{{inputs.parameters.github_repo}}"
+            TOKEN="{{inputs.parameters.github_token}}"
+            TAG="v${VERSION}"
+
+            echo "Downloading artifact: $TAG from $REPO"
+            mkdir -p /workspace/artifact
+
+            # Release info fetch karo
+            RELEASE=$(curl -sf \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/releases/tags/$TAG")
+
+            if [ $? -ne 0 ]; then
+              echo "ERROR: Release $TAG GitHub par nahi mila!"
+              exit 1
+            fi
+
+            # ZIP asset ka URL nikalo
+            ASSET_URL=$(echo "$RELEASE" | python3 -c "
+            import sys, json
+            data = json.load(sys.stdin)
+            assets = data.get('assets', [])
+            if not assets:
+                print('ERROR: No assets found', file=sys.stderr)
+                sys.exit(1)
+            for a in assets:
+                if a['name'].endswith('.zip'):
+                    print(a['url'])
+                    break
+            else:
+                print('ERROR: ZIP not found', file=sys.stderr)
+                sys.exit(1)
+            ")
+
+            echo "Asset URL: $ASSET_URL"
+
+            # ZIP download karo
+            curl -sfL \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$ASSET_URL" \
+              -o /workspace/artifact/release.zip
+
+            SIZE=$(stat -c%s /workspace/artifact/release.zip)
+            echo "Downloaded: $SIZE bytes"
+
+            if [ "$SIZE" -lt 100 ]; then
+              echo "ERROR: File bahut chhota hai — corrupt ho sakta hai"
+              exit 1
+            fi
+
+            # Extract karo
+            cd /workspace/artifact && unzip -q release.zip
+
+            echo "Extracted files:"
+            find /workspace/artifact -type f | sort
+
+            # Helm chart verify karo
+            CHART=$(find /workspace/artifact -name "Chart.yaml" | head -1)
+            if [ -z "$CHART" ]; then
+              echo "ERROR: Chart.yaml nahi mila ZIP mein!"
+              exit 1
+            fi
+            echo "Helm chart found: $(dirname $CHART)"
+
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    # ── Step 2: Helm se deploy karo ─────────────────────────────────────
+    - name: helm-deploy
+      inputs:
+        parameters:
+          - name: app_version
+            value: "{{workflow.parameters.app_version}}"
+          - name: docker_image
+            value: "{{workflow.parameters.docker_image}}"
+          - name: app_namespace
+            value: "{{workflow.parameters.app_namespace}}"
+          - name: artifact_name
+            value: "{{workflow.parameters.artifact_name}}"
+      container:
+        image: alpine/helm:3.14.0
+        command: [sh, -c]
+        args:
+          - |
+            set -e
+
+            # kubectl install
+            apk add --no-cache curl bash
+
+            curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x kubectl && mv kubectl /usr/local/bin/kubectl
+
+            VERSION="{{inputs.parameters.app_version}}"
+            IMAGE="{{inputs.parameters.docker_image}}"
+            NAMESPACE="{{inputs.parameters.app_namespace}}"
+            RELEASE="{{inputs.parameters.artifact_name}}"
+
+            # Helm chart path dhundo
+            HELM_PATH=$(find /workspace/artifact -name "Chart.yaml" | head -1 | xargs dirname)
+            echo "Helm chart: $HELM_PATH"
+            echo "Deploying: $IMAGE:$VERSION → namespace: $NAMESPACE"
+
+            # Namespace create karo agar nahi hai
+            kubectl get namespace $NAMESPACE 2>/dev/null \
+              || kubectl create namespace $NAMESPACE
+
+            # Helm deploy
+            helm upgrade --install "$RELEASE" "$HELM_PATH" \
+              --namespace "$NAMESPACE" \
+              --set image.repository="$IMAGE" \
+              --set image.tag="$VERSION" \
+              --set replicaCount=2 \
+              --atomic \
+              --wait \
+              --timeout 5m \
+              --history-max 5
+
+            echo ""
+            echo "Helm deploy successful!"
+            echo "Pods:"
+            kubectl get pods -n "$NAMESPACE"
+            echo ""
+            echo "Image:"
+            kubectl get deployment "$RELEASE" -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}'
+            echo ""
+            echo "Version $VERSION deployed!"
+
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace

@@ -1,7 +1,6 @@
-name: Deploy to GKE via ArgoCD
+name: Deploy to GKE via Argo Workflows
 
-# ─── Trigger ───────────────────────────────────────────────────────────────
-# ADO pipeline jab version.txt update kare tab trigger hoga
+# ── Trigger: ADO ne version.txt update kiya ───────────────────────────────
 on:
   push:
     branches:
@@ -10,28 +9,30 @@ on:
       - 'version.txt'
 
 env:
-  GKE_CLUSTER:      infovista-gke-cluster
-  GKE_ZONE:         asia-south1-a
-  GCP_PROJECT_ID:   infovista-510914
-  ARGOCD_NAMESPACE: argocd
-  APP_NAMESPACE:    kabir
-  DOCKER_IMAGE:     pawanjadon/kabirepo
+  GKE_CLUSTER:    infovista-gke-cluster
+  GKE_ZONE:       asia-south1-a
+  GCP_PROJECT_ID: infovista-510914
+  ARGO_NAMESPACE: argo
+  APP_NAMESPACE:  kabir
+  DOCKER_IMAGE:   pawanjadon/kabirepo
+  ARTIFACT_NAME:  myapp
+  PULUMI_STACK:   dev
 
-# ═══════════════════════════════════════════════════════════════════════════
 jobs:
 
 # ══════════════════════════════════════════════════════════════════════════
-# STAGE 1: Terraform se GKE Cluster banana
+# STAGE 1 — Pulumi se GKE Cluster banao
 # ══════════════════════════════════════════════════════════════════════════
-  terraform:
-    name: "Stage 1 - Terraform GKE Cluster"
+  pulumi-gke:
+    name: "Stage 1 — Pulumi: Create GKE Cluster"
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: terraform
+        working-directory: pulumi
 
     steps:
-      - name: Checkout repo
+
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Authenticate to GCP
@@ -42,151 +43,73 @@ jobs:
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
 
-      # Cluster pehle se hai to skip, nahi hai to banao
-      - name: Check if GKE cluster exists
+      # Cluster pehle se hai to Pulumi skip karo
+      - name: Check if GKE cluster already exists
         id: check
         run: |
           if gcloud container clusters describe ${{ env.GKE_CLUSTER }} \
-              --zone ${{ env.GKE_ZONE }} --project ${{ env.GCP_PROJECT_ID }} \
-              > /dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "✅ Cluster already exists, skipping Terraform"
+              --zone ${{ env.GKE_ZONE }} \
+              --project ${{ env.GCP_PROJECT_ID }} > /dev/null 2>&1; then
+            echo "cluster_ready=true" >> $GITHUB_OUTPUT
+            echo "Cluster already exists — Pulumi skip karega"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "🔧 Cluster not found, creating..."
+            echo "cluster_ready=false" >> $GITHUB_OUTPUT
+            echo "Cluster nahi mila — Pulumi se banayenge"
           fi
 
-      - name: Setup Terraform
-        if: steps.check.outputs.exists == 'false'
-        uses: hashicorp/setup-terraform@v3
+      - name: Setup Python
+        if: steps.check.outputs.cluster_ready == 'false'
+        uses: actions/setup-python@v5
         with:
-          terraform_version: "1.7.0"
+          python-version: '3.11'
 
-      - name: Terraform Init
-        if: steps.check.outputs.exists == 'false'
-        run: terraform init
+      - name: Install Pulumi CLI
+        if: steps.check.outputs.cluster_ready == 'false'
+        uses: pulumi/actions@v5
 
-      - name: Terraform Apply
-        if: steps.check.outputs.exists == 'false'
-        run: terraform apply -auto-approve
+      - name: Install Python dependencies
+        if: steps.check.outputs.cluster_ready == 'false'
+        run: pip install -r requirements.txt
 
-# ══════════════════════════════════════════════════════════════════════════
-# STAGE 2: ArgoCD Install karo GKE par
-# ══════════════════════════════════════════════════════════════════════════
-  install-argocd:
-    name: "Stage 2 - Install ArgoCD"
-    runs-on: ubuntu-latest
-    needs: terraform
-
-    steps:
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Get GKE credentials
-        uses: google-github-actions/get-gke-credentials@v2
-        with:
-          cluster_name: ${{ env.GKE_CLUSTER }}
-          location:     ${{ env.GKE_ZONE }}
-          project_id:   ${{ env.GCP_PROJECT_ID }}
-
-      - name: Install ArgoCD (agar nahi hai)
+      - name: Pulumi stack select
+        if: steps.check.outputs.cluster_ready == 'false'
         run: |
-          if kubectl get namespace ${{ env.ARGOCD_NAMESPACE }} > /dev/null 2>&1; then
-            echo "✅ ArgoCD already installed, skipping"
-          else
-            echo "🔧 Installing ArgoCD..."
-            kubectl create namespace ${{ env.ARGOCD_NAMESPACE }}
-            kubectl apply -n ${{ env.ARGOCD_NAMESPACE }} \
-              -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-            kubectl wait --for=condition=available \
-              deployment/argocd-server \
-              -n ${{ env.ARGOCD_NAMESPACE }} \
-              --timeout=300s
-            echo "✅ ArgoCD ready"
-          fi
+          pulumi stack select ${{ env.PULUMI_STACK }} --create 2>/dev/null || true
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+          GOOGLE_CREDENTIALS:  ${{ secrets.GCP_SA_KEY }}
 
-# ══════════════════════════════════════════════════════════════════════════
-# STAGE 3: GitHub Release se artifact download + Helm deploy
-# ══════════════════════════════════════════════════════════════════════════
-  deploy:
-    name: "Stage 3 - Download Artifact & Deploy"
-    runs-on: ubuntu-latest
-    needs: install-argocd
-
-    steps:
-      - name: Checkout repo (version.txt ke liye)
-        uses: actions/checkout@v4
-
-      # version.txt se version padhlo (ADO ne likha tha)
-      - name: Read version
+      - name: Pulumi Up — GKE Cluster create
+        if: steps.check.outputs.cluster_ready == 'false'
         run: |
-          VERSION=$(cat version.txt | tr -d '[:space:]')
-          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
-          echo "📦 Version to deploy: $VERSION"
+          pulumi up --yes --stack ${{ env.PULUMI_STACK }} --non-interactive
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+          GOOGLE_CREDENTIALS:  ${{ secrets.GCP_SA_KEY }}
 
-      # ─── GitHub Release se ZIP download karo ───────────────────────────
-      # ADO pipeline ne ye ZIP push kiya tha:
-      #   release tag: v1.0.123
-      #   asset name:  myapp-1.0.123.zip
-      #   ZIP contains: helm/ folder + app/ folder
-      - name: Download artifact ZIP from GitHub Release
+      - name: Confirm cluster ready
         run: |
-          mkdir -p /tmp/artifact
-
-          echo "📥 Fetching release info for tag: v${{ env.APP_VERSION }}"
-
-          # Release info fetch karo
-          RELEASE_JSON=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v${{ env.APP_VERSION }}")
-
-          echo "Release response: $(echo $RELEASE_JSON | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tag_name","NOT FOUND"))')"
-
-          # Asset download URL nikalo
-          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          assets = data.get('assets', [])
-          if not assets:
-              print('ERROR: No assets found in release')
-              sys.exit(1)
-          # myapp-*.zip wala asset dhundo
-          for a in assets:
-              if a['name'].endswith('.zip'):
-                  print(a['browser_download_url'])
-                  break
-          ")
-
-          echo "📥 Downloading from: $DOWNLOAD_URL"
-
-          # ZIP download karo
-          curl -L \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "$DOWNLOAD_URL" \
-            -o /tmp/artifact/release.zip
-
-          # Extract karo
-          cd /tmp/artifact && unzip release.zip
-          echo "✅ Artifact extracted:"
-          ls -la /tmp/artifact/
-
-      # ─── Helm chart ZIP ke andar se dhundo ─────────────────────────────
-      - name: Locate Helm chart in extracted artifact
-        run: |
-          # helm/ folder dhundo extracted ZIP mein
-          HELM_PATH=$(find /tmp/artifact -name "Chart.yaml" | head -1 | xargs dirname)
-          if [ -z "$HELM_PATH" ]; then
-            echo "❌ Chart.yaml not found in artifact!"
-            find /tmp/artifact -type f
+          STATUS=$(gcloud container clusters describe ${{ env.GKE_CLUSTER }} \
+            --zone ${{ env.GKE_ZONE }} \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --format="value(status)")
+          echo "Cluster status: $STATUS"
+          if [ "$STATUS" != "RUNNING" ]; then
+            echo "ERROR: Cluster RUNNING nahi hai!"
             exit 1
           fi
-          echo "✅ Helm chart found at: $HELM_PATH"
-          echo "HELM_CHART_PATH=$HELM_PATH" >> $GITHUB_ENV
+          echo "GKE Cluster ready!"
 
-      # ─── GKE connect karo ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# STAGE 2 — Argo Workflows install karo GKE par
+# ══════════════════════════════════════════════════════════════════════════
+  install-argo:
+    name: "Stage 2 — Install Argo Workflows on GKE"
+    runs-on: ubuntu-latest
+    needs: pulumi-gke
+
+    steps:
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -199,44 +122,126 @@ jobs:
           location:     ${{ env.GKE_ZONE }}
           project_id:   ${{ env.GCP_PROJECT_ID }}
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-
-      # App namespace create karo
-      - name: Create namespace
+      - name: Install Argo Workflows (agar nahi hai)
         run: |
-          kubectl get namespace ${{ env.APP_NAMESPACE }} || \
-          kubectl create namespace ${{ env.APP_NAMESPACE }}
+          if kubectl get namespace ${{ env.ARGO_NAMESPACE }} > /dev/null 2>&1; then
+            echo "Argo Workflows already installed — skip"
+          else
+            echo "Installing Argo Workflows..."
+            kubectl create namespace ${{ env.ARGO_NAMESPACE }}
+            kubectl apply -n ${{ env.ARGO_NAMESPACE }} \
+              -f https://github.com/argoproj/argo-workflows/releases/latest/download/install.yaml
 
-      # ─── Helm se directly deploy karo (chart local ZIP se) ─────────────
-      # ArgoCD use nahi kar rahe kyunki chart remote repo mein nahi hai
-      # Helm directly local chart se install karega
-      - name: Deploy via Helm (from downloaded artifact)
+            echo "Waiting for Argo server to be ready..."
+            kubectl wait --for=condition=available \
+              deployment/argo-server \
+              -n ${{ env.ARGO_NAMESPACE }} \
+              --timeout=300s
+
+            echo "Argo Workflows installed!"
+          fi
+
+      - name: Setup Argo RBAC (deploy permissions)
         run: |
-          echo "🚀 Deploying version ${{ env.APP_VERSION }} via Helm..."
+          kubectl apply -f - <<EOF
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: argo-deploy-admin
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-admin
+          subjects:
+            - kind: ServiceAccount
+              name: default
+              namespace: ${{ env.ARGO_NAMESPACE }}
+          EOF
+          echo "Argo RBAC configured!"
 
-          helm upgrade --install myapp "${{ env.HELM_CHART_PATH }}" \
-            --namespace ${{ env.APP_NAMESPACE }} \
-            --set image.repository=${{ env.DOCKER_IMAGE }} \
-            --set image.tag=${{ env.APP_VERSION }} \
-            --set replicaCount=2 \
+# ══════════════════════════════════════════════════════════════════════════
+# STAGE 3 — Argo Workflow submit karo — ZIP download + Helm deploy
+# ══════════════════════════════════════════════════════════════════════════
+  deploy-via-argo:
+    name: "Stage 3 — Submit Argo Deploy Workflow"
+    runs-on: ubuntu-latest
+    needs: install-argo
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from version.txt
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: version.txt empty hai!"
+            exit 1
+          fi
+          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Deploying version: $VERSION"
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location:     ${{ env.GKE_ZONE }}
+          project_id:   ${{ env.GCP_PROJECT_ID }}
+
+      - name: Install Argo CLI
+        run: |
+          curl -sLO https://github.com/argoproj/argo-workflows/releases/latest/download/argo-linux-amd64.gz
+          gunzip argo-linux-amd64.gz
+          chmod +x argo-linux-amd64
+          sudo mv argo-linux-amd64 /usr/local/bin/argo
+          argo version
+
+      - name: Apply Argo WorkflowTemplate
+        run: |
+          kubectl apply -f argo/helm-deploy-workflow.yaml \
+            -n ${{ env.ARGO_NAMESPACE }}
+          echo "WorkflowTemplate applied!"
+
+      - name: Submit Argo Workflow
+        run: |
+          WORKFLOW_NAME="deploy-$(echo ${{ env.APP_VERSION }} | tr '.' '-')-$(date +%s)"
+          echo "Submitting workflow: $WORKFLOW_NAME"
+          echo "Version: ${{ env.APP_VERSION }}"
+
+          argo submit \
+            --from workflowtemplate/helm-deploy \
+            --name "$WORKFLOW_NAME" \
+            --namespace ${{ env.ARGO_NAMESPACE }} \
+            --parameter app_version=${{ env.APP_VERSION }} \
+            --parameter docker_image=${{ env.DOCKER_IMAGE }} \
+            --parameter app_namespace=${{ env.APP_NAMESPACE }} \
+            --parameter artifact_name=${{ env.ARTIFACT_NAME }} \
+            --parameter github_repo=${{ github.repository }} \
+            --parameter github_token=${{ secrets.GITHUB_TOKEN }} \
             --wait \
-            --timeout 5m
+            --log
 
-          echo "✅ Helm deploy successful!"
+          echo "Argo Workflow complete!"
 
-      # ─── Verify deployment ──────────────────────────────────────────────
       - name: Verify deployment
         run: |
-          kubectl rollout status deployment/myapp \
+          kubectl rollout status deployment/${{ env.ARTIFACT_NAME }} \
             -n ${{ env.APP_NAMESPACE }} --timeout=120s
 
           echo ""
-          echo "🎉 Deployment complete!"
-          echo "📋 Running pods:"
-          kubectl get pods -n ${{ env.APP_NAMESPACE }}
+          echo "Running pods:"
+          kubectl get pods -n ${{ env.APP_NAMESPACE }} -o wide
+
           echo ""
-          echo "🐳 Deployed image:"
-          kubectl get deployment myapp -n ${{ env.APP_NAMESPACE }} \
+          echo "Deployed image:"
+          kubectl get deployment ${{ env.ARTIFACT_NAME }} \
+            -n ${{ env.APP_NAMESPACE }} \
             -o jsonpath='{.spec.template.spec.containers[0].image}'
           echo ""
+          echo "Version ${{ env.APP_VERSION }} successfully deployed via Argo Workflows!"

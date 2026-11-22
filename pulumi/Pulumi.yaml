@@ -1,0 +1,17 @@
+name: infovista-gke
+runtime: python
+description: GKE Cluster for Infovista on GCP
+
+config:
+  projectId:
+    default: infovista-510914
+  region:
+    default: asia-south1
+  zone:
+    default: asia-south1-a
+  clusterName:
+    default: infovista-gke-cluster
+  nodeCount:
+    default: 2
+  machineType:
+    default: e2-medium
